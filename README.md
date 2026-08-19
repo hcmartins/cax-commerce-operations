@@ -1,4 +1,4 @@
-# Commerce Operations Platform
+# Cax Commerce Operations Platform
 
 Architecture and delivery blueprint for the post-approval half of an AI commerce operating system:
 
