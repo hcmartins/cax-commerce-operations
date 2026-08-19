@@ -147,8 +147,23 @@ jobs:
             --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "Deployed: https://$FQDN"
-          curl -sf "https://$FQDN/health" && echo
-          curl -sf "https://$FQDN/ready" && echo
+          # A fresh revision has a brief cold-start window (image pull, container start,
+          # ingress routing) — a single curl -f here reports failure even after a genuinely
+          # successful deploy, so retry instead of racing it.
+          for path in health ready; do
+            for attempt in $(seq 1 10); do
+              if curl -sf "https://$FQDN/$path"; then
+                echo
+                break
+              fi
+              echo "  /$path not ready yet (attempt $attempt/10), retrying in 5s..."
+              sleep 5
+              if [ "$attempt" = 10 ]; then
+                echo "::error::/$path did not become healthy in time"
+                exit 1
+              fi
+            done
+          done
 
   deploy-prod:
     # Both jobs are listed explicitly: `needs.<job>.outputs` only resolves for jobs named
@@ -227,5 +242,17 @@ jobs:
             --resource-group ${{ vars.PROD_AZURE_RESOURCE_GROUP }} \
             --query properties.configuration.ingress.fqdn -o tsv)
           echo "Deployed: https://$FQDN"
-          curl -sf "https://$FQDN/health" && echo
-          curl -sf "https://$FQDN/ready" && echo
+          for path in health ready; do
+            for attempt in $(seq 1 10); do
+              if curl -sf "https://$FQDN/$path"; then
+                echo
+                break
+              fi
+              echo "  /$path not ready yet (attempt $attempt/10), retrying in 5s..."
+              sleep 5
+              if [ "$attempt" = 10 ]; then
+                echo "::error::/$path did not become healthy in time"
+                exit 1
+              fi
+            done
+          done
