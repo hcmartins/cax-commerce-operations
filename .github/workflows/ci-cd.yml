@@ -1,0 +1,231 @@
+name: CI/CD
+
+# Test on every push/PR; build, tag, push, and deploy only on pushes to main.
+# DEV deploys automatically; PROD sits behind the "production" GitHub
+# Environment, which required-reviewer protection makes a manual-approval
+# gate (see README.md's "Setting up CI/CD" for the one-time setup this
+# workflow depends on — Azure OIDC federated credential, RBAC, repo
+# secrets/variables, and the environment protection rule itself, none of
+# which a workflow file can configure on its own). Mirrors
+# commerce-intelligence's .github/workflows/ci-cd.yml for consistency across
+# the platform's repos, adapted for this app's uv toolchain, multi-target
+# Dockerfile, and its distinct one-shot `migrate` process (commerce-intelligence
+# migrates on container startup instead — see architecture.md in
+# commerce-infrastructure for why this app keeps migration separate).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  id-token: write   # required for OIDC login to Azure (azure/login) — no stored client secret
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  UV_VERSION: "0.8.14"   # matches the version pinned in Dockerfile
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install --no-cache-dir "uv==${{ env.UV_VERSION }}"
+
+      - run: uv sync --dev
+
+      - run: uv run ruff format --check src tests streamlit_app.py
+
+      - run: uv run ruff check .
+
+      # Unit, integration, contract, workflow, and e2e suites all live under tests/ and are
+      # self-contained (SQLite-backed) — no live database needed for this job.
+      - run: uv run pytest -q
+
+  build-and-push:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image tag (app version + short commit SHA)
+        id: meta
+        run: |
+          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "tag=${VERSION}-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - run: az acr login --name ${{ vars.ACR_NAME }}
+
+      - name: Build and push API + migrate images
+        run: |
+          API_IMAGE="${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-api"
+          MIGRATE_IMAGE="${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-migrate"
+          TAG="${{ steps.meta.outputs.tag }}"
+
+          docker build --target api -t "$API_IMAGE:$TAG" -t "$API_IMAGE:${{ github.sha }}" .
+          docker build --target migrate -t "$MIGRATE_IMAGE:$TAG" -t "$MIGRATE_IMAGE:${{ github.sha }}" .
+
+          docker push "$API_IMAGE:$TAG"
+          docker push "$API_IMAGE:${{ github.sha }}"
+          docker push "$MIGRATE_IMAGE:$TAG"
+          docker push "$MIGRATE_IMAGE:${{ github.sha }}"
+
+  deploy-dev:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: dev   # no required reviewers — deploys automatically on merge to main
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Point the Container App at the new image
+        run: |
+          az containerapp update \
+            --name commerce-operations-api \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --image ${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-api:${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Allow this runner through the Postgres firewall (removed below, always)
+        id: firewall
+        run: |
+          IP=$(curl -s --max-time 5 https://api.ipify.org)
+          RULE="gh-actions-${{ github.run_id }}"
+          echo "rule=$RULE" >> "$GITHUB_OUTPUT"
+          az postgres flexible-server firewall-rule create \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --server-name ${{ vars.POSTGRES_SERVER_NAME }} \
+            --name "$RULE" \
+            --start-ip-address "$IP" --end-ip-address "$IP"
+
+      - name: Run database migrations
+        run: |
+          DB_URL=$(az keyvault secret show \
+            --vault-name ${{ vars.KEY_VAULT_NAME }} \
+            --name commerce-operations-database-url \
+            --query value -o tsv)
+          az acr login --name ${{ vars.ACR_NAME }}
+          docker run --rm -e COMMERCE_DATABASE_URL="$DB_URL" \
+            ${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-migrate:${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Remove the temporary firewall rule
+        if: always()
+        run: |
+          az postgres flexible-server firewall-rule delete \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --server-name ${{ vars.POSTGRES_SERVER_NAME }} \
+            --name "${{ steps.firewall.outputs.rule }}" \
+            --yes || echo "::warning::Could not remove firewall rule ${{ steps.firewall.outputs.rule }} — remove it manually."
+
+      - name: Verify health and readiness
+        run: |
+          FQDN=$(az containerapp show \
+            --name commerce-operations-api \
+            --resource-group ${{ vars.AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "Deployed: https://$FQDN"
+          curl -sf "https://$FQDN/health" && echo
+          curl -sf "https://$FQDN/ready" && echo
+
+  deploy-prod:
+    # Both jobs are listed explicitly: `needs.<job>.outputs` only resolves for jobs named
+    # directly in this array — GitHub Actions does not propagate outputs transitively through
+    # deploy-dev even though deploy-dev itself depends on build-and-push.
+    needs: [deploy-dev, build-and-push]
+    runs-on: ubuntu-latest
+    # "production" environment: configure required reviewers under this repo's
+    # Settings -> Environments -> production. That approval gate is what makes
+    # this a manual step — the workflow file itself can't create it.
+    environment: production
+    steps:
+      - name: Skip cleanly if PROD infra isn't provisioned yet
+        id: guard
+        run: |
+          if [ -z "${{ vars.PROD_AZURE_RESOURCE_GROUP }}" ]; then
+            echo "PROD_AZURE_RESOURCE_GROUP is not set — PROD infrastructure hasn't been provisioned yet. Skipping deploy-prod."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: azure/login@v2
+        if: steps.guard.outputs.skip == 'false'
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Point PROD Container App at the new image
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          az containerapp update \
+            --name commerce-operations-api \
+            --resource-group ${{ vars.PROD_AZURE_RESOURCE_GROUP }} \
+            --image ${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-api:${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Allow this runner through the PROD Postgres firewall (removed below, always)
+        if: steps.guard.outputs.skip == 'false'
+        id: firewall
+        run: |
+          IP=$(curl -s --max-time 5 https://api.ipify.org)
+          RULE="gh-actions-${{ github.run_id }}"
+          echo "rule=$RULE" >> "$GITHUB_OUTPUT"
+          az postgres flexible-server firewall-rule create \
+            --resource-group ${{ vars.PROD_AZURE_RESOURCE_GROUP }} \
+            --server-name ${{ vars.PROD_POSTGRES_SERVER_NAME }} \
+            --name "$RULE" \
+            --start-ip-address "$IP" --end-ip-address "$IP"
+
+      - name: Run PROD database migrations
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          DB_URL=$(az keyvault secret show \
+            --vault-name ${{ vars.PROD_KEY_VAULT_NAME }} \
+            --name commerce-operations-database-url \
+            --query value -o tsv)
+          az acr login --name ${{ vars.ACR_NAME }}
+          docker run --rm -e COMMERCE_DATABASE_URL="$DB_URL" \
+            ${{ vars.ACR_LOGIN_SERVER }}/commerce-operations-migrate:${{ needs.build-and-push.outputs.image-tag }}
+
+      - name: Remove the temporary PROD firewall rule
+        if: always() && steps.guard.outputs.skip == 'false'
+        run: |
+          az postgres flexible-server firewall-rule delete \
+            --resource-group ${{ vars.PROD_AZURE_RESOURCE_GROUP }} \
+            --server-name ${{ vars.PROD_POSTGRES_SERVER_NAME }} \
+            --name "${{ steps.firewall.outputs.rule }}" \
+            --yes || echo "::warning::Could not remove firewall rule ${{ steps.firewall.outputs.rule }} — remove it manually."
+
+      - name: Verify PROD health and readiness
+        if: steps.guard.outputs.skip == 'false'
+        run: |
+          FQDN=$(az containerapp show \
+            --name commerce-operations-api \
+            --resource-group ${{ vars.PROD_AZURE_RESOURCE_GROUP }} \
+            --query properties.configuration.ingress.fqdn -o tsv)
+          echo "Deployed: https://$FQDN"
+          curl -sf "https://$FQDN/health" && echo
+          curl -sf "https://$FQDN/ready" && echo
