@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "source_system": "commerce-intelligence",
+  "source_product_id": "intel-product-123",
+  "source_workflow_run_id": "intel-run-456",
+  "source_recommendation_id": "recommendation-789",
+  "product": {
+    "name": "Reusable water bottle",
+    "brand": null,
+    "identifiers": {"gtin": null},
+    "attributes": {"colour": "black", "capacity_ml": 750}
+  },
+  "selected_supplier": {
+    "source_supplier_id": "supplier-42",
+    "name": "Example Supplier",
+    "contact_details": {},
+    "terms": {"incoterm": "FOB"}
+  },
+  "supplier_quote": {
+    "source_quote_id": "quote-7",
+    "currency": "GBP",
+    "moq": 100,
+    "quantity": 100,
+    "unit_cost": "4.20",
+    "shipping_cost": "80.00",
+    "lead_time_days": 21,
+    "valid_until": "2026-09-15"
+  },
+  "economics": {
+    "estimated_landed_cost_per_unit": "5.00",
+    "recommended_selling_price": "14.99",
+    "expected_profit_per_unit": "6.50",
+    "margin_percent": "43.36",
+    "roi_percent": "130.00"
+  },
+  "recommendation": {
+    "evidence": [{"type": "analysis", "reference": "evidence-9"}],
+    "decided_at": "2026-08-15T09:00:00Z"
+  }
+}
