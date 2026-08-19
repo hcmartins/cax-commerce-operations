@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-commerce_operations}
+      POSTGRES_USER: ${POSTGRES_USER:-commerce}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD through the deployment secret store}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    image: ${COMMERCE_MIGRATE_IMAGE:-commerce-operations-migrate:latest}
+    build:
+      context: .
+      target: migrate
+    environment:
+      COMMERCE_ENVIRONMENT: production
+      COMMERCE_DATABASE_URL: ${COMMERCE_DATABASE_URL:?set COMMERCE_DATABASE_URL through the deployment secret store}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    read_only: true
+    tmpfs: [/tmp]
+
+  api:
+    image: ${COMMERCE_API_IMAGE:-commerce-operations-api:latest}
+    build:
+      context: .
+      target: api
+    environment:
+      COMMERCE_ENVIRONMENT: production
+      COMMERCE_DATABASE_URL: ${COMMERCE_DATABASE_URL:?set COMMERCE_DATABASE_URL through the deployment secret store}
+      COMMERCE_API_KEYS: ${COMMERCE_API_KEYS:?set COMMERCE_API_KEYS through the deployment secret store}
+      COMMERCE_API_ROLES: ${COMMERCE_API_ROLES:?set COMMERCE_API_ROLES through the deployment configuration}
+      COMMERCE_CORS_ORIGINS: ${COMMERCE_CORS_ORIGINS:-[]}
+      COMMERCE_LOG_LEVEL: ${COMMERCE_LOG_LEVEL:-INFO}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/ready')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    image: ${COMMERCE_WORKER_IMAGE:-commerce-operations-worker:latest}
+    build:
+      context: .
+      target: worker
+    environment:
+      COMMERCE_ENVIRONMENT: production
+      COMMERCE_DATABASE_URL: ${COMMERCE_DATABASE_URL:?set COMMERCE_DATABASE_URL through the deployment secret store}
+      COMMERCE_LOG_LEVEL: ${COMMERCE_LOG_LEVEL:-INFO}
+      COMMERCE_WORKER_HEARTBEAT_PATH: /tmp/commerce-worker-heartbeat
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "python", "-m", "commerce_operations.worker", "--healthcheck"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    image: ${COMMERCE_FRONTEND_IMAGE:-commerce-operations-frontend:latest}
+    build:
+      context: .
+      target: frontend
+    environment:
+      HOME: /tmp
+      COMMERCE_ENVIRONMENT: production
+      COMMERCE_DATABASE_URL: ${COMMERCE_DATABASE_URL:?set COMMERCE_DATABASE_URL through the deployment secret store}
+      COMMERCE_DASHBOARD_ACCESS_KEY: ${COMMERCE_DASHBOARD_ACCESS_KEY:?set COMMERCE_DASHBOARD_ACCESS_KEY through the deployment secret store}
+      COMMERCE_DASHBOARD_CURRENCY: ${COMMERCE_DASHBOARD_CURRENCY:-GBP}
+    ports:
+      - "${FRONTEND_PORT:-8501}:8501"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    read_only: true
+    tmpfs: [/tmp]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
