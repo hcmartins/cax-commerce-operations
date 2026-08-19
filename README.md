@@ -207,15 +207,20 @@ CONTAINER_APP_NAME=commerce-operations-api \
 ```
 
 This creates an Azure AD app registration trusted via OIDC federated credentials (no client secret
-stored anywhere). Since `rg-commerce-dev` is shared with `commerce-intelligence-api`, the grant is
-scoped as narrowly as Azure allows: `Reader` on the resource group, `AcrPush` on the registry
-(push+pull; ACR has no per-repository scoping to narrow further), `Container Apps Contributor`
-scoped to just the `commerce-operations-api` Container App, `Key Vault Secrets User` scoped to the
-vault (needed to read the database URL for migrations — Azure RBAC has no finer-grained, per-secret
-role), and `Contributor` scoped to just the Postgres server resource (needed to manage the temporary
-migration firewall rule). This identity can never touch `commerce-intelligence-api` or the shared
-storage account. The script prints the exact GitHub repo secrets/variables to set from its output.
-Then, in the repo's Settings:
+stored anywhere) — two per subject (name-based and GitHub's newer immutable owner/repo-ID format,
+auto-issued for repos created/renamed/transferred on or after 2026-07-15; trusting only the old
+format fails with `AADSTS700213` against such a repo). Since `rg-commerce-dev` is shared with
+`commerce-intelligence-api`, the grant is scoped as narrowly as Azure allows: `Reader` on the
+resource group, `AcrPush` on the registry (push+pull; ACR has no per-repository scoping to narrow
+further), `Container Apps Contributor` scoped to just the `commerce-operations-api` Container App,
+`Key Vault Secrets User` scoped to the vault (needed to read the database URL for migrations — Azure
+RBAC has no finer-grained, per-secret role), `Contributor` scoped to just the Postgres server
+resource (needed to manage the temporary migration firewall rule), and `Managed Identity Operator`
+scoped to just this app's own identity resource (`az containerapp update` resubmits the Container
+App's identity reference, which ARM's linked-authorization check validates against this action —
+`Container Apps Contributor` alone does not include it). This identity can never touch
+`commerce-intelligence-api` or the shared storage account. The script prints the exact GitHub repo
+secrets/variables to set from its output. Then, in the repo's Settings:
 
 - **Environments** → create `dev` (no protection rules) and `production` (add required reviewers —
   this is the manual-approval gate).

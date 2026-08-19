@@ -23,8 +23,36 @@
 #     resource group) — needed to create/delete the temporary per-run firewall
 #     rule that lets the GitHub-hosted runner reach Postgres to run migrations.
 #
+# A third grant, easy to miss: Managed Identity Operator, scoped to this
+# app's own identity resource (id-commerce-operations-api). `az containerapp
+# update` resubmits the Container App's full definition, including its
+# `identity.userAssignedIdentities` reference — Azure Resource Manager's
+# "linked authorization" check then requires the caller to hold
+# `Microsoft.ManagedIdentity/userAssignedIdentities/assign/action` on that
+# referenced identity. Container Apps Contributor does not include this
+# action (verified: `az role definition list --name "Container Apps
+# Contributor"` has no Microsoft.ManagedIdentity/* entries at all), so
+# without this grant every deploy fails with a linked-authorization error
+# even though the Container App write itself would otherwise be permitted.
+#
+# Two federated credentials are created per subject (name-based AND
+# immutable-ID-based), not one: GitHub began issuing OIDC tokens with an
+# immutable-subject format (repo:<owner>@<owner_id>/<repo>@<repo_id>:...)
+# automatically for repositories created, renamed, or transferred on or
+# after 2026-07-15 — see
+# https://github.blog/changelog/2026-04-23-immutable-subject-claims-for-github-actions-oidc-tokens/
+# and https://learn.microsoft.com/en-us/entra/workload-id/workload-identities-github-immutable-subjects.
+# A federated credential trusting only the old name-based subject fails
+# with AADSTS700213 ("no matching federated identity record") against such
+# a repo. This script creates both so it works whether or not the repo has
+# opted in / been auto-migrated; keeping the name-based one alongside is
+# harmless (GitHub only ever presents one subject per token, matched
+# against whichever credential fits).
+#
 # Run once per repo, after the GitHub repository exists (the federated
-# credentials below are scoped to its exact owner/name).
+# credentials below are scoped to its exact owner/name/IDs). Requires network
+# access to api.github.com to resolve the owner/repo numeric IDs; for a
+# private repository, export GITHUB_TOKEN so that lookup is authenticated.
 #
 # Usage:
 #   GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
@@ -34,6 +62,14 @@
 #   ./infrastructure/setup-github-oidc.sh
 
 set -euo pipefail
+
+# Disable Git Bash's automatic POSIX-to-Windows path conversion for this
+# script's lifetime — without it, MSYS silently rewrites any argument that
+# looks like an absolute path (e.g. --scope /subscriptions/...) into a
+# garbled Windows path before az ever sees it, and `az role assignment
+# create` fails with a cryptic "MissingSubscription" error. No-op outside
+# Git Bash on Windows.
+export MSYS_NO_PATHCONV=1
 
 : "${GITHUB_OWNER:?Set GITHUB_OWNER (the GitHub org or user that owns the repo)}"
 : "${GITHUB_REPO:?Set GITHUB_REPO (repo name only, no owner prefix)}"
@@ -57,12 +93,27 @@ else
   echo "Reusing existing app $APP_ID"
 fi
 
-# Three federated credentials, matching the three distinct OIDC subject
-# claims the workflow's jobs present: the build-and-push job (no
-# `environment:`, so its subject is the branch ref) and the two deploy jobs
-# (each declares `environment:`, which changes the subject to that
-# environment's name instead of the branch ref) — getting a subject wrong
-# here is the most common cause of "no matching federated identity record".
+# Resolve GitHub's immutable owner/repo IDs (best-effort — falls back to
+# name-based-only credentials if this repo can't be reached, e.g. offline).
+echo "=== Resolving GitHub owner/repo IDs for immutable subjects ==="
+GH_AUTH_HEADER=()
+if [ -n "${GITHUB_TOKEN:-}" ]; then
+  GH_AUTH_HEADER=(-H "Authorization: Bearer ${GITHUB_TOKEN}")
+fi
+GH_REPO_JSON=$(curl -s "${GH_AUTH_HEADER[@]}" "https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}" || true)
+OWNER_ID=$(echo "$GH_REPO_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('owner',{}).get('id',''))" 2>/dev/null || true)
+REPO_ID=$(echo "$GH_REPO_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+if [ -n "$OWNER_ID" ] && [ -n "$REPO_ID" ]; then
+  echo "  owner_id=$OWNER_ID repo_id=$REPO_ID"
+else
+  echo "  Could not resolve owner/repo IDs — only name-based credentials will be created."
+  echo "  If this repo was created/renamed/transferred on or after 2026-07-15, GitHub may"
+  echo "  issue immutable-subject tokens by default and login will fail with AADSTS700213"
+  echo "  until you re-run this script (or add the immutable credentials manually)."
+fi
+
+# Two federated credentials per subject — see the comment block above for why
+# both the name-based and immutable-ID-based forms are created.
 echo "=== Federated credentials ==="
 create_fic() {
   local name=$1 subject=$2
@@ -81,6 +132,12 @@ create_fic() {
 create_fic "main-branch"        "repo:${GITHUB_OWNER}/${GITHUB_REPO}:ref:refs/heads/main"
 create_fic "dev-environment"    "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:dev"
 create_fic "prod-environment"   "repo:${GITHUB_OWNER}/${GITHUB_REPO}:environment:production"
+if [ -n "$OWNER_ID" ] && [ -n "$REPO_ID" ]; then
+  IMMUTABLE="${GITHUB_OWNER}@${OWNER_ID}/${GITHUB_REPO}@${REPO_ID}"
+  create_fic "main-branch-immutable"      "repo:${IMMUTABLE}:ref:refs/heads/main"
+  create_fic "dev-environment-immutable"  "repo:${IMMUTABLE}:environment:dev"
+  create_fic "prod-environment-immutable" "repo:${IMMUTABLE}:environment:production"
+fi
 
 echo "=== RBAC (scoped to this app only — rg-commerce-dev is shared) ==="
 RG_ID="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
@@ -88,12 +145,36 @@ ACR_ID=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query id -o tsv)
 CONTAINER_APP_ID=$(az containerapp show -g "$RESOURCE_GROUP" -n "$CONTAINER_APP_NAME" --query id -o tsv)
 KEY_VAULT_ID=$(az keyvault show -g "$RESOURCE_GROUP" -n "$KEY_VAULT_NAME" --query id -o tsv)
 POSTGRES_ID=$(az postgres flexible-server show -g "$RESOURCE_GROUP" -n "$POSTGRES_SERVER_NAME" --query id -o tsv)
+IDENTITY_ID=$(az identity show -g "$RESOURCE_GROUP" -n "id-${CONTAINER_APP_NAME}" --query id -o tsv)
+SP_ID=$(az ad sp show --id "$APP_ID" --query id -o tsv)
 
-az role assignment create --role Reader --assignee "$APP_ID" --scope "$RG_ID" -o none || echo "  Reader already assigned"
-az role assignment create --role AcrPush --assignee "$APP_ID" --scope "$ACR_ID" -o none || echo "  AcrPush already assigned"
-az role assignment create --role "Container Apps Contributor" --assignee "$APP_ID" --scope "$CONTAINER_APP_ID" -o none || echo "  Container Apps Contributor already assigned"
-az role assignment create --role "Key Vault Secrets User" --assignee "$APP_ID" --scope "$KEY_VAULT_ID" -o none || echo "  Key Vault Secrets User already assigned"
-az role assignment create --role Contributor --assignee "$APP_ID" --scope "$POSTGRES_ID" -o none || echo "  Contributor (Postgres) already assigned"
+# Role assignments target the service principal's object ID, not the app ID —
+# `--assignee <appId>` intermittently fails to resolve right after the SP is
+# created. A failed `create` here is verified against a real `list`, not
+# assumed to mean "already assigned": that assumption is exactly what
+# previously hid a real failure (Git Bash's path-mangling breaking every
+# `--scope`, invisible because every failure printed the same reassuring
+# fallback message).
+assign_role() {
+  local role=$1 scope=$2
+  if az role assignment create --role "$role" --assignee "$SP_ID" --scope "$scope" -o none 2>/dev/null; then
+    echo "  $role: created"
+  elif az role assignment list --assignee "$SP_ID" --scope "$scope" --query "[?roleDefinitionName=='$role']" -o tsv | grep -q .; then
+    echo "  $role: already assigned"
+  else
+    echo "  $role: FAILED — not present after create attempt. Scope: $scope" >&2
+    return 1
+  fi
+}
+assign_role "Reader" "$RG_ID"
+assign_role "AcrPush" "$ACR_ID"
+assign_role "Container Apps Contributor" "$CONTAINER_APP_ID"
+assign_role "Key Vault Secrets User" "$KEY_VAULT_ID"
+assign_role "Contributor" "$POSTGRES_ID"
+# Closes the "linked authorization" gap: az containerapp update resubmits the
+# Container App's identity reference, which ARM checks against this action —
+# see the comment block above this script's header.
+assign_role "Managed Identity Operator" "$IDENTITY_ID"
 
 ACR_LOGIN_SERVER=$(az acr show -g "$RESOURCE_GROUP" -n "$ACR_NAME" --query loginServer -o tsv)
 
