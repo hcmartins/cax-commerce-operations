@@ -42,7 +42,8 @@ src/commerce_operations/
 tests/               Unit, integration, contract, workflow and end-to-end tests
 contracts/           Versioned HTTP/event contracts and examples
 docs/                Architecture and delivery decisions
-infrastructure/      Local and deployment assets (added during implementation)
+infrastructure/      Local Docker entrypoint + GitHub OIDC setup script for CI/CD
+.github/             CI/CD workflow (ci-cd.yml): test on every push/PR, build+push+deploy on push to main
 streamlit_app.py     Operations dashboard entry point
 ```
 
@@ -179,6 +180,47 @@ uv run python scripts/smoke_test.py --base-url http://localhost:8000
 
 Pass `--api-key` if `COMMERCE_API_AUTH_ENABLED=true`. The script exits non-zero if any check fails,
 so it is safe to use as a post-deploy gate.
+
+## CI/CD
+
+[`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml): on every push/PR it runs `ruff` +
+`pytest` (unit, integration, contract, workflow and e2e — all self-contained, no live database
+needed); on push to `main`, it additionally builds the `api` and `migrate` images, tags both
+`<app-version>-<short-sha>`, pushes them to ACR, and deploys — to DEV automatically, to PROD only
+after a required reviewer approves (a GitHub Environment protection rule on `production`, not
+something the workflow file itself can create — that's a manual step in this repo's own Settings).
+
+Unlike commerce-intelligence (which migrates on container startup), this app keeps migration as a
+distinct one-shot step — matching its own architecture and `docs/deployment.md` — so `deploy-dev`
+and `deploy-prod` each open a temporary, uniquely-named Postgres firewall rule for the runner's
+public IP, run the pushed `migrate` image against Key Vault's `commerce-operations-database-url`
+secret, then remove the rule before verifying `/health` and `/ready`.
+
+**One-time setup**, once this repo exists on GitHub:
+
+```bash
+GITHUB_OWNER=<org-or-user> GITHUB_REPO=<repo-name> \
+RESOURCE_GROUP=rg-commerce-dev ACR_NAME=acrcommercedevzqbs3z \
+KEY_VAULT_NAME=kv-commerce-dev-zqbs3z POSTGRES_SERVER_NAME=psql-commerce-dev-zqbs3z \
+CONTAINER_APP_NAME=commerce-operations-api \
+./infrastructure/setup-github-oidc.sh
+```
+
+This creates an Azure AD app registration trusted via OIDC federated credentials (no client secret
+stored anywhere). Since `rg-commerce-dev` is shared with `commerce-intelligence-api`, the grant is
+scoped as narrowly as Azure allows: `Reader` on the resource group, `AcrPush` on the registry
+(push+pull; ACR has no per-repository scoping to narrow further), `Container Apps Contributor`
+scoped to just the `commerce-operations-api` Container App, `Key Vault Secrets User` scoped to the
+vault (needed to read the database URL for migrations — Azure RBAC has no finer-grained, per-secret
+role), and `Contributor` scoped to just the Postgres server resource (needed to manage the temporary
+migration firewall rule). This identity can never touch `commerce-intelligence-api` or the shared
+storage account. The script prints the exact GitHub repo secrets/variables to set from its output.
+Then, in the repo's Settings:
+
+- **Environments** → create `dev` (no protection rules) and `production` (add required reviewers —
+  this is the manual-approval gate).
+- Leave `PROD_AZURE_RESOURCE_GROUP` / `PROD_KEY_VAULT_NAME` / `PROD_POSTGRES_SERVER_NAME` unset until
+  PROD infrastructure actually exists; `deploy-prod` skips cleanly without them rather than failing.
 
 ## Tests and quality checks
 
